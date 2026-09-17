@@ -1,0 +1,4 @@
+interface:
+  display_name: YTPMV Maker
+  short_description: Generate YTPMV audio from MIDI and multiple materials
+  default_prompt: Use the YTPMVmaker shared CLI/core module to generate or configure a MIDI-based 音MAD project.
