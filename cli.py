@@ -15,16 +15,18 @@ from ytpmv_core import (
     midi_to_notes,
     render_video,
 )
+from main import OUTPUTS_DIR, ensure_project_directories, timestamp_label
 
 
 def main():
+    ensure_project_directories()
     parser = argparse.ArgumentParser(description="複数素材からMIDI音MADを生成")
     parser.add_argument("--material", "-m", action="append", help="音声素材（複数指定可）")
     parser.add_argument("--midi", help="MIDIファイル")
     parser.add_argument("--bgm", help="BGMファイル")
     parser.add_argument("--bgm-volume", type=float, default=None,
                         help="BGM音量(dB)。BGMの基準音量-24dBFSに対する相対値。既定は0")
-    parser.add_argument("--output-dir", default=".")
+    parser.add_argument("--output-dir", default=str(OUTPUTS_DIR))
     parser.add_argument("--bpm", type=int, default=120)
     parser.add_argument("--base-note", type=int, default=None,
                         help="素材の基準音（MIDI番号）。未指定なら自動判定します")
@@ -47,6 +49,7 @@ def main():
     bgm = data.get("bgm") or args.bgm
     outdir = Path(data.get("output_dir", args.output_dir))
     outdir.mkdir(parents=True, exist_ok=True)
+    stamp = timestamp_label()
     regions = data.get("material_regions", [{"start": 0, "end": 0, "mode": "auto"} for _ in materials])
     assignments = {int(k): int(v) for k, v in data.get("track_assignments", {}).items()}
     volumes = {int(k): float(v) for k, v in data.get("track_volumes", {}).items()}
@@ -105,10 +108,10 @@ def main():
                   f"（{profile.get('recommended_reason', '')}）")
         profiles[i] = profile
 
-    wav = outdir / "otomad_result.wav"
-    mp3 = outdir / "otomad_result.mp3"
+    wav = outdir / f"{stamp}_otomad_result.wav"
+    mp3 = outdir / f"{stamp}_otomad_result.mp3"
     if args.solo_track is not None:
-        wav = outdir / f"track_{args.solo_track + 1}.wav"
+        wav = outdir / f"{stamp}_track_{args.solo_track + 1}.wav"
         mp3 = None
 
     # 割り当てが未指定なら、素材の基準音・明るさから自動で決めて音量バランスも整える。
@@ -118,7 +121,9 @@ def main():
             track_names = {i: (track.name or "") for i, track in enumerate(mido.MidiFile(midi).tracks)}
             assignments = auto_assign_materials(notes, profiles, track_names)
             if not volumes:
-                volumes = auto_track_volumes(notes, bpm if bpm > 0 else midi_bpm, tpq)
+                volumes = auto_track_volumes(
+                    notes, bpm if bpm > 0 else midi_bpm, tpq, bgm_volume
+                )
             print("自動割り当て:")
             for track in sorted(assignments):
                 name = track_names.get(track) or f"トラック {track + 1}"
@@ -168,8 +173,8 @@ def main():
                 i % len(videos),
             )
 
-    timeline = str(outdir / "video_timeline.json")
-    mp4 = str(outdir / "otomad_result.mp4")
+    timeline = str(outdir / f"{stamp}_video_timeline.json")
+    mp4 = str(outdir / f"{stamp}_otomad_result.mp4")
     try:
         clip_count = build_video_timeline(materials, midi, bpm, base, assignments, base_notes,
                                           regions, videos, video_assignments, timeline,

@@ -37,6 +37,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
+起動時にプロジェクト直下へ `materials/`（素材用）と `outputs/`（成果物用）が自動作成されます。CLI・GUIとも、出力先を指定しない場合は `outputs/` を使い、生成物名には `YYYYMMDD_HHMMSS_mmm` 形式のタイムスタンプが付きます。外部にある素材ファイルは移動せず、そのまま読み込みます。
+
 ## CLI
 
 素材を複数指定して生成できます。

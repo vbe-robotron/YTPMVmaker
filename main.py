@@ -183,21 +183,217 @@ def _load_material_library(path: str, region: dict, normalize: bool) -> tuple[Au
     return selected, chunks
 
 
+def _wsola_shift(samples: np.ndarray, factor: float, frame_rate: int) -> np.ndarray:
+    """WSOLA (Waveform Similarity Overlap-Add) によるタイムストレッチ。
+
+    factor > 1 で再生速度を上げる（後でリサンプルで音程も上げる）。
+    音の長さを変えるためのコアで、最終的には元の長さに戻してピッチシフトに使う。
+    """
+    # ウィンドウ・ホップサイズを音程補正向けに調整（短い素材でも動くよう小さめに）
+    win_ms = 40         # 分析ウィンドウ 40ms
+    hop_ms = 10         # 合成ホップ 10ms
+    win_size = max(64, int(frame_rate * win_ms / 1000))
+    hop_syn = max(16, int(frame_rate * hop_ms / 1000))
+    hop_ana = max(16, int(round(hop_syn * factor)))
+    search = max(8, win_size // 4)  # 類似位置の探索幅
+
+    n = len(samples)
+    if n < win_size:
+        # 極端に短い素材はリサンプルで代用
+        return samples
+
+    # ハニング窓（正規化済み）
+    window = np.hanning(win_size).astype(np.float32)
+
+    # 出力バッファ（元と同じ長さを目標に）
+    target_len = n  # 後段で元長さに合わせるので概算でよい
+    out = np.zeros(target_len + win_size * 2, dtype=np.float64)
+    norm = np.zeros_like(out)
+
+    pos_ana = 0
+    pos_syn = 0
+    prev_ana = 0
+
+    while pos_syn + win_size <= len(out):
+        if pos_ana + win_size > n:
+            break
+
+        # 最初のフレーム以外は前フレームとの類似位置を探す
+        if pos_ana == 0:
+            best = pos_ana
+        else:
+            lo = max(0, pos_ana - search)
+            hi = min(n - win_size, pos_ana + search)
+            if lo >= hi:
+                best = pos_ana
+            else:
+                # 前フレームの後半と次フレーム候補の前半の相関で最良位置を選ぶ
+                ref = samples[prev_ana: prev_ana + win_size] * window
+                best_corr = -np.inf
+                best = pos_ana
+                step = max(1, (hi - lo) // 16)  # 探索を粗くして高速化
+                for start in range(lo, hi, step):
+                    candidate = samples[start: start + win_size] * window
+                    corr = float(np.dot(ref, candidate))
+                    if corr > best_corr:
+                        best_corr = corr
+                        best = start
+
+        frame = (samples[best: best + win_size] * window).astype(np.float64)
+        out[pos_syn: pos_syn + win_size] += frame
+        norm[pos_syn: pos_syn + win_size] += window.astype(np.float64) ** 2
+
+        prev_ana = best
+        pos_ana = best + hop_ana
+        pos_syn += hop_syn
+
+    # 正規化（ゼロ除算を防ぐ）
+    safe = norm > 1e-8
+    out[safe] /= norm[safe]
+    # 合成長を元の長さにクリップ
+    out = out[:target_len]
+    return out.astype(np.float32)
+
+
 def pitch_shift(audio: AudioSegment, semitones: float) -> AudioSegment:
-    """速度を変えずに近似的にピッチ変更する簡易実装。
-    厳密なタイムストレッチではなく、サンプルレート変更→元レートへ戻す方式。"""
-    if abs(semitones) < 0.001:
-        return audio
-    factor = 2 ** (semitones / 12.0)
-    new_rate = max(1000, int(audio.frame_rate * factor))
-    shifted = audio._spawn(audio.raw_data, overrides={"frame_rate": new_rate})
-    return shifted.set_frame_rate(audio.frame_rate)
+    """WSOLA + リサンプルによる高品質ピッチシフト。
+
+    長さを保ちながら音程だけを変える。
+    - |semitones| < 0.5 : 誤差が無視できるため高速パスを使う
+    - それ以外 : WSOLA でタイムストレッチ → リサンプルで音程補正
+    """
+    if abs(semitones) < 0.5:
+        if abs(semitones) < 0.01:
+            return audio
+        # 小さいずれはレート操作のみ（速度変化は ±3% 未満で聴感上無視できる）
+        factor = 2 ** (semitones / 12.0)
+        new_rate = max(1000, int(audio.frame_rate * factor))
+        return audio._spawn(audio.raw_data, overrides={"frame_rate": new_rate}).set_frame_rate(audio.frame_rate)
+
+    factor = 2 ** (semitones / 12.0)   # > 1 で高音化
+    frame_rate = audio.frame_rate
+    channels = audio.channels
+    sample_width = audio.sample_width
+
+    raw = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float32)
+
+    if channels == 2:
+        raw = raw.reshape(-1, 2)
+        out_ch = []
+        for ch in range(2):
+            # WSOLA で 1/factor 倍に時間伸縮（これをリサンプルで元の長さに戻すと音程が変わる）
+            stretched = _wsola_shift(raw[:, ch], 1.0 / factor, frame_rate)
+            # リサンプルで元の長さに戻す → 音程が factor 倍になる
+            n_orig = len(raw)
+            n_str = len(stretched)
+            if n_str > 0 and n_orig > 0:
+                indices = np.linspace(0, n_str - 1, n_orig)
+                i0 = np.floor(indices).astype(np.int64)
+                i1 = np.clip(i0 + 1, 0, n_str - 1)
+                frac = (indices - i0).astype(np.float32)
+                resampled = stretched[i0] * (1 - frac) + stretched[i1] * frac
+            else:
+                resampled = np.zeros(n_orig, dtype=np.float32)
+            out_ch.append(resampled)
+        result = np.stack(out_ch, axis=1).flatten()
+    else:
+        stretched = _wsola_shift(raw, 1.0 / factor, frame_rate)
+        n_orig = len(raw)
+        n_str = len(stretched)
+        if n_str > 0 and n_orig > 0:
+            indices = np.linspace(0, n_str - 1, n_orig)
+            i0 = np.floor(indices).astype(np.int64)
+            i1 = np.clip(i0 + 1, 0, n_str - 1)
+            frac = (indices - i0).astype(np.float32)
+            result = stretched[i0] * (1 - frac) + stretched[i1] * frac
+        else:
+            result = np.zeros(n_orig, dtype=np.float32)
+
+    clipped = np.clip(result, -32768, 32767).astype(np.int16)
+    return audio._spawn(clipped.tobytes(), overrides={
+        "frame_rate": frame_rate, "channels": channels, "sample_width": sample_width,
+    })
 
 
 def normalize_clip(audio: AudioSegment, target_dbfs=-18.0) -> AudioSegment:
     if audio.rms == 0:
         return audio
     return audio.apply_gain(target_dbfs - audio.dBFS)
+
+
+
+def _estimate_base_note_hps(samples: np.ndarray, frame_rate: int) -> int:
+    """HPS（高調波積スペクトル）＋マルチフレーム投票による基音推定。
+
+    単純な FFT ピークは倍音を誤検出しやすい。HPS は各倍音を間引いて積算することで
+    基音成分だけを強調できる。複数フレームの投票により雑音に頑健になる。
+
+    返値は MIDI ノート番号（21〜108）。
+    """
+    frame_size = 4096   # 周波数分解能を確保（44100Hz で約10.7Hz/bin）
+    hop = frame_size // 2
+    n_harmonics = 5     # HPS の次数
+
+    f_lo, f_hi = 55.0, 1200.0  # 探索周波数帯域 (Hz)
+
+    window = np.hanning(frame_size).astype(np.float32)
+    vote: dict[int, float] = {}
+
+    n = len(samples)
+    frame_starts = list(range(0, n - frame_size + 1, hop))
+    if not frame_starts:
+        return 60
+
+    frame_rms = []
+    for start in frame_starts:
+        seg = samples[start: start + frame_size]
+        frame_rms.append(float(np.sqrt(np.mean(seg ** 2))))
+
+    peak_rms = max(frame_rms) if frame_rms else 0.0
+    threshold_rms = peak_rms * 0.30
+
+    for fi, start in enumerate(frame_starts):
+        if frame_rms[fi] < threshold_rms:
+            continue
+
+        seg = samples[start: start + frame_size].copy() * window
+        spectrum = np.abs(np.fft.rfft(seg))
+        freqs = np.fft.rfftfreq(frame_size, 1.0 / frame_rate)
+
+        # HPS: 各倍音の間引き積算
+        hps = spectrum.copy().astype(np.float64)
+        for h in range(2, n_harmonics + 1):
+            decimated_len = len(spectrum) // h
+            if decimated_len < 2:
+                break
+            src_idx = np.arange(decimated_len) * h
+            src_idx = np.clip(src_idx, 0, len(spectrum) - 1)
+            hps[:decimated_len] *= spectrum[src_idx]
+            hps[decimated_len:] = 0.0
+
+        valid = (freqs >= f_lo) & (freqs <= f_hi) & (np.arange(len(freqs)) < len(hps))
+        if not np.any(valid):
+            continue
+
+        f0_hz = float(freqs[valid][np.argmax(hps[valid])])
+        if f0_hz <= 0:
+            continue
+
+        midi_note = int(round(69 + 12 * math.log2(f0_hz / 440.0)))
+        midi_note = max(21, min(108, midi_note))
+        vote[midi_note] = vote.get(midi_note, 0.0) + frame_rms[fi]
+
+    if not vote:
+        return 60
+
+    # 隣接半音への票の拡散で安定化してから最多票を採用
+    smoothed: dict[int, float] = {}
+    for note, weight in vote.items():
+        for offset, decay in ((0, 1.0), (-1, 0.3), (1, 0.3)):
+            n2 = note + offset
+            if 21 <= n2 <= 108:
+                smoothed[n2] = smoothed.get(n2, 0.0) + weight * decay
+    return max(smoothed, key=smoothed.__getitem__)
 
 
 def analyze_material(path: str) -> dict:
@@ -207,13 +403,15 @@ def analyze_material(path: str) -> dict:
               "flatness", "harmonicity", "attack_ms", "crest",
               "recommended_mode", "recommended_reason"}。
     brightness はスペクトル重心(Hz)で、高いほど明るい（倍音の多い）音。
+    base_note は HPS＋マルチフレーム投票で推定し、旧実装より倍音誤検出が少ない。
     """
     audio = AudioSegment.from_file(path).set_channels(1).set_frame_rate(44100)
     result = {
         "duration_ms": len(audio), "base_note": 60, "brightness": 440.0, "dbfs": -60.0,
         "flatness": 1.0, "harmonicity": 0.0, "attack_ms": 0.0, "crest": 1.0, "sustain_ratio": 1.0,
     }
-    segment = audio[:3000] if len(audio) > 3000 else audio
+    # アタック〜安定部を含む最大 5 秒を解析する
+    segment = audio[:5000] if len(audio) > 5000 else audio
     samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
     if not len(samples) or np.max(np.abs(samples)) == 0:
         result["recommended_mode"], result["recommended_reason"] = recommend_play_mode(result)
@@ -226,18 +424,23 @@ def analyze_material(path: str) -> dict:
     result["flatness"], result["harmonicity"] = _spectral_metrics(samples, audio.frame_rate)
     result["attack_ms"], result["crest"], result["sustain_ratio"] = _envelope_metrics(samples, audio.frame_rate)
 
+    # 基準音: HPS＋マルチフレーム投票（旧: 単一フレームの FFT ピーク）
+    result["base_note"] = _estimate_base_note_hps(samples, audio.frame_rate)
+
+    # 明るさ（スペクトル重心）: 全帯域の平均スペクトルから計算
     windowed = samples * np.hanning(len(samples))
     spectrum = np.abs(np.fft.rfft(windowed))
     freqs = np.fft.rfftfreq(len(samples), 1 / audio.frame_rate)
-    valid = (freqs >= 65) & (freqs <= 1200)
-    if np.any(valid):
-        band = spectrum[valid]
+    valid_b = (freqs >= 65) & (freqs <= 8000)
+    if np.any(valid_b):
+        band = spectrum[valid_b]
         total = float(band.sum())
-        result["base_note"] = int(round(69 + 12 * math.log2(freqs[valid][np.argmax(band)] / 440)))
         if total > 0:
-            result["brightness"] = float((freqs[valid] * band).sum() / total)
+            result["brightness"] = float((freqs[valid_b] * band).sum() / total)
     result["recommended_mode"], result["recommended_reason"] = recommend_play_mode(result)
     return result
+
+
 
 
 def analyze_materials(paths: list[str]) -> list[dict | Exception]:
@@ -435,11 +638,11 @@ def auto_track_volumes(
 ) -> dict[int, float]:
     """トラックごとの音量バランスを自動調整してdBで返す。
 
-    - 音数が多い（密な）トラックは合計音量が大きくなるため抑える
-    - 最も音数が多いトラック（主旋律）は少し持ち上げる
-    - 低音は埋もれやすいので少し持ち上げ、高音は抑える
-    - MIDIベロシティ平均が高いトラックを少し前に出す
-    - BGMがある場合・BGMを大きくした場合はMIDI側を持ち上げて埋もれにくくする
+    - 音数が多い（密な）トラックは合計エネルギーが大きくなりすぎないよう適度に抑える
+    - 主旋律トラックは埋もれないよう適度に引き上げる
+    - 低音・高音の聴感特性を補正
+    - MIDIベロシティの相対差を適正範囲（±1.0dB）で反映し、極端な格差を防止
+    - 全体として極端に大きすぎる・小さすぎるトラックが出ないよう適正範囲に抑制
     """
     if not notes:
         return {}
@@ -463,13 +666,12 @@ def auto_track_volumes(
     reference = sorted_densities[len(sorted_densities) // 2] or 1.0
     main_track = max(by_track, key=lambda track: len(by_track[track]))
 
-    # BGMがある場合のベースリフト（BGM音量に比例して MIDI 側を浮かせる）
+    # BGMがある場合のベースリフト（BGM音量に比例して適度に持ち上げる）
     bgm_lift = 0.0
     if has_bgm:
-        # BGMなしでも +1dB、BGM音量が大きいほど追加補正
-        bgm_lift = 1.0 + max(-2.0, min(3.0, float(bgm_gain_db) * 0.6))
+        bgm_lift = 0.5 + max(-1.5, min(2.0, float(bgm_gain_db) * 0.4))
 
-    # 全トラックのベロシティ平均（正規化用）
+    # 全トラックのベロシティ平均の正規化（極端な格差を出さないよう滑らかに）
     all_velocities = list(mean_velocities.values())
     vel_min = min(all_velocities)
     vel_max = max(all_velocities)
@@ -477,18 +679,26 @@ def auto_track_volumes(
 
     volumes: dict[int, float] = {}
     for track in by_track:
-        volume = -1.5 * math.log2(max(0.01, densities[track]) / max(0.01, reference))
-        volume = max(-3.0, min(3.0, volume))
+        # 音数密度の補正（急激な倍率にならないよう制限）
+        ratio = max(0.1, densities[track]) / max(0.1, reference)
+        density_comp = -1.0 * math.log2(ratio)
+        volume = max(-2.0, min(2.0, density_comp))
+        
         if track == main_track:
-            volume += 2.0
-        # 低音は持ち上げ、高音は抑える
-        volume += max(-2.0, min(2.0, (72 - mean_notes[track]) * 0.05))
-        # ベロシティが高いトラックを少し前に出す（±1.5dB の範囲）
-        vel_norm = (mean_velocities[track] - vel_min) / vel_range  # 0~1
-        volume += max(-1.5, min(1.5, (vel_norm - 0.5) * 3.0))
+            volume += 1.2
+            
+        # 音域補正（極端にならないよう穏やかに）
+        volume += max(-1.0, min(1.0, (72 - mean_notes[track]) * 0.03))
+        
+        # ベロシティ補正（最大±1.0dB）
+        vel_norm = (mean_velocities[track] - vel_min) / vel_range
+        volume += max(-1.0, min(1.0, (vel_norm - 0.5) * 2.0))
+        
         # BGM補正
         volume += bgm_lift
-        volumes[track] = round(max(-6.0, min(8.0, volume)), 1)
+        
+        # トラック全体音量は±3.5dBの安定レンジにクランプ
+        volumes[track] = round(max(-3.5, min(3.5, volume)), 1)
     return volumes
 
 
@@ -559,6 +769,38 @@ def make_song(
     clip_cache = {}
     cache_lock = threading.Lock()
 
+    # 各素材の音量を基準(-18 dBFS)へ均一化し、素材ごとの録音音量差による極端な大小を解消
+    normalized_libraries = []
+    for material, chunks in libraries:
+        norm_mat = normalize_clip(material, target_dbfs=-18.0)
+        normalized_libraries.append((norm_mat, chunks))
+    libraries = normalized_libraries
+
+    # 各素材のチョップ粒を事前に解析して基準音を推定しておく（ピッチ最小選択用）
+    # 粒数が多い場合は重いので、最大 32 粒まで解析する
+    _chunk_base_notes: dict[int, list[int]] = {}
+    for mi, (material, chunks) in enumerate(libraries):
+        if regions[mi].get("mode") == "raw":
+            _chunk_base_notes[mi] = [0] * len(chunks)
+            continue
+        src_base = (material_base_notes or [base_note])[mi]
+        notes_per_chunk: list[int] = []
+        limit = min(len(chunks), 32)
+        for ci in range(limit):
+            src_start, src_end = chunks[ci]
+            seg = material[src_start:src_end].set_channels(1).set_frame_rate(44100)
+            seg_samples = np.frombuffer(seg.raw_data, dtype=np.int16).astype(np.float32)
+            # 粒が十分長い場合のみ HPS で基音推定、短い場合は素材基準音を使う
+            if len(seg_samples) >= 4096 * 2:
+                chunk_note = _estimate_base_note_hps(seg_samples, 44100)
+            else:
+                chunk_note = src_base
+            notes_per_chunk.append(chunk_note)
+        # 粒が 32 未満の場合は末尾の値で埋める
+        if len(chunks) > limit:
+            notes_per_chunk.extend([notes_per_chunk[-1]] * (len(chunks) - limit))
+        _chunk_base_notes[mi] = notes_per_chunk
+
     # ノートごとのパラメータ計算（軽い）は逐次で行い、
     # ピッチシフトやゲイン・パンなどの音声処理（重い）は並列で行う。
     jobs = []
@@ -567,19 +809,36 @@ def make_song(
         material_index = material_index % len(libraries)
         selected_region = regions[material_index]
         chunks = libraries[material_index][1]
-        chunk_index = i % len(chunks)
+
+        if selected_region.get("mode") == "raw":
+            # rawモードは音程を使わないので単純な循環インデックス
+            chunk_index = i % len(chunks)
+            shift = 0
+        else:
+            # ピッチシフト量が最小になるチョップ粒を選ぶ
+            chunk_base_notes = _chunk_base_notes[material_index]
+            best_ci = 0
+            best_shift_abs = float("inf")
+            # 全粒から最小シフト量のものを選ぶ（粒が1つの場合は即決）
+            for ci in range(len(chunks)):
+                s = n.note - chunk_base_notes[ci]
+                if abs(s) < best_shift_abs:
+                    best_shift_abs = abs(s)
+                    best_ci = ci
+            chunk_index = best_ci
+            shift = n.note - chunk_base_notes[best_ci]
+
         # ノート長へ収める
         note_ms = max(35, int((n.duration_tick / tpq) * (60000 / max(1, bpm))))
-        source_base = (material_base_notes or [base_note])[material_index]
-        shift = n.note - source_base if selected_region.get("mode") != "raw" else 0
         # ベロシティを音量へ、左右に軽く振る
         track_volume = (track_volumes or {}).get(n.track, 0.0)
         # 初期値は控えめにして、必要ならトラック音量で上げられるようにする。
         # MIDIベロシティを十分なダイナミックレンジで反映する。
         # 低ベロシティは控えめ、高ベロシティは明確に前へ出す。
+        # ベロシティのダイナミックレンジを圧縮し、小さすぎる音や突き抜ける爆音を防止
         velocity = max(1, min(127, n.velocity)) / 127.0
-        velocity_gain = (velocity ** 0.7) * 10.0 - 10.0
-        gain = -20 + velocity_gain + track_volume
+        velocity_gain = (velocity ** 0.5) * 6.0 - 6.0  # 最大6dBの範囲で自然に追従
+        gain = -12.0 + velocity_gain + track_volume
         pan = math.sin(i * 0.7) * 0.35
         start_ms = int((n.start_tick / tpq) * (60000 / max(1, bpm)))
         jobs.append((
@@ -599,9 +858,15 @@ def make_song(
             clip = pitch_shift(material[src_start:src_end], shift)
             if len(clip) > note_ms:
                 clip = clip[:note_ms]
-            elif len(clip) < note_ms:
+            elif len(clip) < note_ms and len(clip) > 0:
+                # ループ繰り返しでノート長へ伸ばす。継ぎ目をクロスフェードで滑らかにする
+                fade_ms = min(20, len(clip) // 4)
                 reps = math.ceil(note_ms / max(1, len(clip)))
-                clip = (clip * reps)[:note_ms]
+                looped = clip * reps
+                # クロスフェードで継ぎ目のクリックを抑制
+                if fade_ms > 0 and len(looped) > fade_ms * 2:
+                    looped = looped.fade_in(fade_ms).fade_out(fade_ms)
+                clip = looped[:note_ms]
             with cache_lock:
                 clip = clip_cache.setdefault(cache_key, clip)
         # apply_gain/set_frame_rate/set_channels は新しいSegmentを返すため、
