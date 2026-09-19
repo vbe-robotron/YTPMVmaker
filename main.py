@@ -7,6 +7,7 @@ import tempfile
 import shutil
 import subprocess
 import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -15,6 +16,23 @@ import flet as ft
 from pydub import AudioSegment, silence
 import mido
 import numpy as np
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+MATERIALS_DIR = PROJECT_ROOT / "materials"
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+
+
+def ensure_project_directories() -> tuple[Path, Path]:
+    """素材と成果物の標準フォルダを作成して返す。"""
+    MATERIALS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    return MATERIALS_DIR, OUTPUTS_DIR
+
+
+def timestamp_label() -> str:
+    """同一秒内の複数生成も区別できるタイムスタンプを返す。"""
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
 def _worker_count(env_name: str, default: int, cap: int | None = None) -> int:
@@ -411,12 +429,17 @@ def auto_assign_materials(
     return result
 
 
-def auto_track_volumes(notes: list["Note"], bpm: int, tpq: int) -> dict[int, float]:
+def auto_track_volumes(
+    notes: list["Note"], bpm: int, tpq: int, bgm_gain_db: float = 0.0,
+    has_bgm: bool = False,
+) -> dict[int, float]:
     """トラックごとの音量バランスを自動調整してdBで返す。
 
     - 音数が多い（密な）トラックは合計音量が大きくなるため抑える
     - 最も音数が多いトラック（主旋律）は少し持ち上げる
     - 低音は埋もれやすいので少し持ち上げ、高音は抑える
+    - MIDIベロシティ平均が高いトラックを少し前に出す
+    - BGMがある場合・BGMを大きくした場合はMIDI側を持ち上げて埋もれにくくする
     """
     if not notes:
         return {}
@@ -428,15 +451,29 @@ def auto_track_volumes(notes: list["Note"], bpm: int, tpq: int) -> dict[int, flo
     beat_ms = 60000 / max(1, bpm)
     densities: dict[int, float] = {}
     mean_notes: dict[int, float] = {}
+    mean_velocities: dict[int, float] = {}
     for track, ns in by_track.items():
         end_tick = max(n.start_tick + n.duration_tick for n in ns)
         seconds = max(0.1, end_tick / max(1, tpq) * beat_ms / 1000)
         densities[track] = len(ns) / seconds
         mean_notes[track] = sum(n.note for n in ns) / len(ns)
+        mean_velocities[track] = sum(n.velocity for n in ns) / len(ns)
 
     sorted_densities = sorted(densities.values())
     reference = sorted_densities[len(sorted_densities) // 2] or 1.0
     main_track = max(by_track, key=lambda track: len(by_track[track]))
+
+    # BGMがある場合のベースリフト（BGM音量に比例して MIDI 側を浮かせる）
+    bgm_lift = 0.0
+    if has_bgm:
+        # BGMなしでも +1dB、BGM音量が大きいほど追加補正
+        bgm_lift = 1.0 + max(-2.0, min(3.0, float(bgm_gain_db) * 0.6))
+
+    # 全トラックのベロシティ平均（正規化用）
+    all_velocities = list(mean_velocities.values())
+    vel_min = min(all_velocities)
+    vel_max = max(all_velocities)
+    vel_range = max(1.0, vel_max - vel_min)
 
     volumes: dict[int, float] = {}
     for track in by_track:
@@ -444,8 +481,14 @@ def auto_track_volumes(notes: list["Note"], bpm: int, tpq: int) -> dict[int, flo
         volume = max(-3.0, min(3.0, volume))
         if track == main_track:
             volume += 2.0
+        # 低音は持ち上げ、高音は抑える
         volume += max(-2.0, min(2.0, (72 - mean_notes[track]) * 0.05))
-        volumes[track] = round(max(-6.0, min(6.0, volume)), 1)
+        # ベロシティが高いトラックを少し前に出す（±1.5dB の範囲）
+        vel_norm = (mean_velocities[track] - vel_min) / vel_range  # 0~1
+        volume += max(-1.5, min(1.5, (vel_norm - 0.5) * 3.0))
+        # BGM補正
+        volume += bgm_lift
+        volumes[track] = round(max(-6.0, min(8.0, volume)), 1)
     return volumes
 
 
@@ -532,7 +575,11 @@ def make_song(
         # ベロシティを音量へ、左右に軽く振る
         track_volume = (track_volumes or {}).get(n.track, 0.0)
         # 初期値は控えめにして、必要ならトラック音量で上げられるようにする。
-        gain = -24 + (n.velocity / 127.0) * 4 + track_volume
+        # MIDIベロシティを十分なダイナミックレンジで反映する。
+        # 低ベロシティは控えめ、高ベロシティは明確に前へ出す。
+        velocity = max(1, min(127, n.velocity)) / 127.0
+        velocity_gain = (velocity ** 0.7) * 10.0 - 10.0
+        gain = -20 + velocity_gain + track_volume
         pan = math.sin(i * 0.7) * 0.35
         start_ms = int((n.start_tick / tpq) * (60000 / max(1, bpm)))
         jobs.append((
@@ -921,6 +968,7 @@ def _encode_video_segment(ffmpeg, segment, out_path, scale_filter, width, height
 
 class App:
     def __init__(self, page: ft.Page):
+        ensure_project_directories()
         self.page = page
         page.title = "音MAD Auto Maker"
         page.window.width = 1050
@@ -941,11 +989,13 @@ class App:
         self.track_volumes = {}
         self.assignment_list = ft.Column()
         self.midi = ft.TextField(label="MIDI (任意)", expand=True)
-        self.bgm = ft.TextField(label="BGM (任意)", expand=True)
-        self.bgm_volume = ft.TextField(label="BGM音量dB", value="0", width=130)
+        self.bgm = ft.TextField(label="BGM (任意)", expand=True,
+                                on_change=lambda e: self.rebalance_volumes())
+        self.bgm_volume = ft.TextField(label="BGM音量dB", value="0", width=130,
+                                       on_change=lambda e: self.rebalance_volumes())
         self.video_size = ft.TextField(label="動画サイズ", value="1280x720", width=150)
         self.video_fps = ft.TextField(label="FPS", value="30", width=90)
-        self.output_dir = ft.TextField(label="出力フォルダ", value=str(Path.cwd()), expand=True)
+        self.output_dir = ft.TextField(label="成果物フォルダ", value=str(OUTPUTS_DIR), expand=True)
         self.bpm = ft.TextField(label="BPM", value="120", width=130)
         self.base_note = ft.TextField(label="素材の基準音 (MIDI番号)", value="60", width=180)
         # 並列数（空欄で自動）。値を変えると次の生成から反映される。
@@ -1050,9 +1100,9 @@ class App:
             end = min(len(audio), int(region["end"]))
             if end <= start:
                 raise ValueError("切り出し範囲が不正です")
-            outdir = Path(self.output_dir.value.strip() or ".")
+            outdir = Path(self.output_dir.value.strip() or OUTPUTS_DIR)
             outdir.mkdir(parents=True, exist_ok=True)
-            out = outdir / f"{Path(path).stem}_selected_{index}.wav"
+            out = outdir / f"{timestamp_label()}_{Path(path).stem}_selected_{index}.wav"
             await asyncio.to_thread(audio[start:end].export, str(out), format="wav")
             return out
         except Exception as ex:
@@ -1112,9 +1162,9 @@ class App:
                 raise ValueError("音声素材を指定してください。")
             self.add_log(f"並列数: {self.apply_worker_settings()}")
             midi = self.midi.value.strip() or None
-            outdir = Path(self.output_dir.value.strip() or ".")
+            outdir = Path(self.output_dir.value.strip() or OUTPUTS_DIR)
             outdir.mkdir(parents=True, exist_ok=True)
-            out = str(outdir / f"track_{track_index + 1}_preview.wav")
+            out = str(outdir / f"{timestamp_label()}_track_{track_index + 1}_preview.wav")
 
             self.progress.value = 0
             self.add_log(f"トラック {track_index + 1} を生成中…")
@@ -1361,12 +1411,12 @@ class App:
                 "bpm": self.bpm.value, "base_note": self.base_note.value, "output_dir": self.output_dir.value}
 
     def save_project(self, e):
-        path = Path(self.output_dir.value.strip() or ".") / "otomad_project.json"
+        path = Path(self.output_dir.value.strip() or OUTPUTS_DIR) / "otomad_project.json"
         path.write_text(json.dumps(self.project_data(), ensure_ascii=False, indent=2), encoding="utf-8")
         self.add_log(f"プロジェクト保存: {path}")
 
     def load_project(self, e):
-        path = Path(self.output_dir.value.strip() or ".") / "otomad_project.json"
+        path = Path(self.output_dir.value.strip() or OUTPUTS_DIR) / "otomad_project.json"
         if not path.exists():
             self.add_log(f"プロジェクトがありません: {path}")
             return
@@ -1426,7 +1476,8 @@ class App:
             bpm = int(float(self.bpm.value))
             if bpm <= 0:
                 bpm = midi_bpm
-            volumes = auto_track_volumes(notes, bpm, tpq)
+            has_bgm = bool(self.bgm.value.strip())
+            volumes = auto_track_volumes(notes, bpm, tpq, self._bgm_volume(), has_bgm=has_bgm)
             self.track_volumes.update(volumes)
 
             self.refresh_assignments()
@@ -1440,6 +1491,33 @@ class App:
             self.add_log(f"自動割り当て＋バランス調整: {len(assignments)}トラック")
         except Exception as ex:
             self.add_log(f"自動割り当てエラー: {type(ex).__name__}: {ex}")
+
+    def rebalance_volumes(self, e=None):
+        """MIDIとBGM設定を元にトラック音量だけを再計算してUIへ反映する。
+
+        BGM音量フィールドやBGMパスの変更時に呼ばれ、素材の再割り当ては行わない。
+        MIDI・素材が未設定の場合は何もしない。
+        """
+        if not self.midi.value.strip() or not self.materials:
+            return
+        try:
+            midi_path = self.midi.value.strip()
+            notes, midi_bpm, tpq = midi_to_notes(midi_path)
+            if not notes:
+                return
+            bpm = int(float(self.bpm.value or 0))
+            if bpm <= 0:
+                bpm = midi_bpm
+            has_bgm = bool(self.bgm.value.strip())
+            volumes = auto_track_volumes(notes, bpm, tpq, self._bgm_volume(), has_bgm=has_bgm)
+            self.track_volumes.update(volumes)
+            self.refresh_assignments()
+            bgm_label = f"BGM音量 {self._bgm_volume():+.1f}dB" if has_bgm else "BGMなし"
+            self.add_log(f"音量を再バランス（{bgm_label}）: " + ", ".join(
+                f"T{t+1} {v:+.1f}dB" for t, v in sorted(volumes.items())
+            ))
+        except Exception as ex:
+            self.add_log(f"音量再バランスエラー: {type(ex).__name__}: {ex}")
 
     async def add_material(self, e):
         await self.pick_file(None, ["wav", "mp3", "flac", "ogg"])
@@ -1502,6 +1580,10 @@ class App:
                         # MIDIを読み込んだら割り当てとバランスを自動で決める。
                         self.auto_assign_tracks()
                     return
+                if field is self.bgm:
+                    # BGMファイルを選択したらトラック音量を再バランス。
+                    self.rebalance_volumes()
+                    return
                 self.page.update()
 
         except Exception as ex:
@@ -1552,10 +1634,11 @@ class App:
         bgm_volume = self._bgm_volume()
         bpm = int(float(self.bpm.value))
         base_note = int(self.base_note.value)
-        outdir = Path(self.output_dir.value.strip() or ".")
+        outdir = Path(self.output_dir.value.strip() or OUTPUTS_DIR)
         outdir.mkdir(parents=True, exist_ok=True)
-        wav = str(outdir / "otomad_result.wav")
-        mp3 = str(outdir / "otomad_result.mp3")
+        stamp = timestamp_label()
+        wav = str(outdir / f"{stamp}_otomad_result.wav")
+        mp3 = str(outdir / f"{stamp}_otomad_result.mp3")
 
         if bgm:
             self.add_log(f"音声を生成中…（BGM音量 {bgm_volume:+.1f}dB）")
@@ -1606,7 +1689,7 @@ class App:
                 raise ValueError("動画生成にはMIDIが必要です。")
             video_assignments = self._video_assignments_or_raise()
             width, height, fps = self.video_settings()
-            outdir = Path(self.output_dir.value.strip() or ".")
+            outdir = Path(self.output_dir.value.strip() or OUTPUTS_DIR)
             outdir.mkdir(parents=True, exist_ok=True)
 
             self.progress.value = 0
@@ -1616,7 +1699,8 @@ class App:
             wav, _mp3, count, duration = await self._generate_audio(cb)
             self.add_log(f"音声生成完了: {count}ノート / {duration/1000:.1f}秒")
 
-            timeline = str(outdir / "video_timeline.json")
+            stamp = Path(wav).name.split("_otomad_result", 1)[0]
+            timeline = str(outdir / f"{stamp}_video_timeline.json")
             clip_count = await asyncio.to_thread(
                 build_video_timeline, self.materials, self.midi.value.strip(),
                 int(float(self.bpm.value)), int(self.base_note.value),
@@ -1626,7 +1710,7 @@ class App:
             )
             self.add_log(f"タイムライン: {clip_count}クリップ → {timeline}")
 
-            mp4 = str(outdir / "otomad_result.mp4")
+            mp4 = str(outdir / f"{stamp}_otomad_result.mp4")
             video_cb = self.progress_callback("映像を書き出し中…")
             segments = await asyncio.to_thread(
                 render_video, timeline, wav, mp4, width, height, fps, "hold", video_cb
@@ -1643,12 +1727,12 @@ class App:
             if not self.materials or not self.midi.value.strip():
                 raise ValueError("動画テンプレートには素材とMIDIが必要です。")
             self.add_log(f"並列数: {self.apply_worker_settings()}")
-            outdir = Path(self.output_dir.value.strip() or ".")
+            outdir = Path(self.output_dir.value.strip() or OUTPUTS_DIR)
             outdir.mkdir(parents=True, exist_ok=True)
             bpm = int(float(self.bpm.value))
             base = int(self.base_note.value)
             width, height, fps = self.video_settings()
-            out = str(outdir / "video_timeline.json")
+            out = str(outdir / f"{timestamp_label()}_video_timeline.json")
             count = await asyncio.to_thread(
                 build_video_timeline, self.materials, self.midi.value.strip(), bpm, base,
                 dict(self.track_assignments), self.material_base_notes, self.material_regions,
